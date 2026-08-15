@@ -11,11 +11,21 @@ per forward pass we stream each decoder layer's weights from the safetensors sha
 dequantize int8->bf16 on the GPU, run the layer, and immediately move the layer back
 to `meta` + `torch.cuda.empty_cache()` so only ~1 layer is resident at a time.
 
-The forward is replicated manually (not via model.forward) so we can load/free layers
-inside the loop. The manual loop is bit-identical to GlmMoeDsaModel.forward.
+Two expert-loading modes (--experts):
+  * `ondemand` (default): for sparse MoE layers, first load only the small non-expert
+    weights + the top-k router, run the layer's attention + router to discover exactly
+    which experts the router selects (8/token), then load *only those* experts instead
+    of all 256. ~30x less NFS I/O per sparse layer. Output is bit-identical to `full`
+    because the eager expert forward only touches the selected expert rows.
+  * `full`: load all 256 experts every time (the pre-optimization behavior, kept for
+    verification / comparison).
 
-Generation: greedy argmax (temperature = 0), prompt "中国的首都是", 2 tokens.
-Expected first token: "北京" (vocab id 99334).
+A tmpfs ramdisk (--ramcache, e.g. /mnt/glm_ram) caches the dequantized bf16
+non-expert weights of every layer (~33 GB total) so repeated decode passes skip the
+NFS read + dequant for them.
+
+Generation: greedy argmax (temperature = 0), prompt "中国的首都是", N tokens.
+Expected first token: "北京" (vocab id 99334). Every decoded token is printed live.
 """
 
 import argparse
@@ -55,6 +65,9 @@ EXPECTED_FIRST_TOKEN_ID = 99334  # "北京"
 
 PROMPT = "中国的首都是"
 GEN_TOKENS = 2
+
+RAM_DIR = "/mnt/glm_ram"
+EXPERT_PARAMS = {"mlp.experts.gate_up_proj", "mlp.experts.down_proj"}
 
 
 def gpu_mem_gb():
@@ -125,13 +138,139 @@ def dequantize(w, scale):
     return (w.to(DEVICE).to(torch.float32) * scale.to(DEVICE).to(torch.float32)).to(DTYPE)
 
 
-def load_layer(model, config, layer_idx, weight_map):
-    """Stream one decoder layer's weights from its shards onto the GPU."""
+def ensure_ramdisk(path=RAM_DIR, size_gb=40):
+    """Mount a tmpfs ramdisk at `path` if not already mounted. Returns path or None."""
+    if os.path.ismount(path):
+        print(f"ramdisk already mounted at {path}")
+        return path
+    os.makedirs(path, exist_ok=True)
+    r = subprocess.run(
+        ["mount", "-t", "tmpfs", "-o", f"size={size_gb}g", "tmpfs", path],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        print(f"ramdisk mount failed ({r.stderr.strip()}); continuing without ramcache")
+        return None
+    print(f"ramdisk mounted at {path} ({size_gb}G tmpfs)")
+    return path
+
+
+def _apply_sd(layer, sd, allow_missing_experts=False):
+    """load_state_dict(assign=True, strict=False) + safety net that materializes any remaining meta param."""
+    res = layer.load_state_dict(sd, assign=True, strict=False)
+    if res.missing_keys:
+        if allow_missing_experts:
+            unexpected_missing = [k for k in res.missing_keys if k not in EXPERT_PARAMS]
+            if unexpected_missing:
+                raise RuntimeError(f"layer missing keys: {unexpected_missing}")
+        else:
+            raise RuntimeError(f"layer missing keys: {res.missing_keys}")
+    if res.unexpected_keys:
+        raise RuntimeError(f"layer unexpected keys: {res.unexpected_keys[:10]}")
+    # Safety net: materialize any remaining meta parameter as a fresh GPU zero Parameter
+    # (direct `.data =` on a meta Parameter fails on this ROCm torch build).
+    for name, p in layer.named_parameters():
+        if p.is_meta:
+            parts = name.split(".")
+            mod = layer
+            for part in parts[:-1]:
+                mod = getattr(mod, part)
+            setattr(mod, parts[-1], torch.nn.Parameter(torch.zeros(p.shape, dtype=DTYPE, device=DEVICE), requires_grad=False))
+
+
+def load_non_expert(model, config, layer_idx, keys, ramcache):
+    """Load a layer's non-expert weights (attention + norms + router + shared experts),
+    optionally from a ramdisk cache (dequantized bf16). Expert params are left as GPU
+    zeros for the on-demand path (filled later by load_experts_used)."""
     prefix = f"model.layers.{layer_idx}."
-    keys = [k for k in weight_map if k.startswith(prefix)]
+    sd = None
+    if ramcache:
+        p = os.path.join(ramcache, f"layer{layer_idx}_ne.pt")
+        if os.path.exists(p):
+            try:
+                sd = torch.load(p, map_location=DEVICE, weights_only=True)
+            except Exception:  # noqa: BLE001
+                sd = None
+
+    if sd is None:
+        by_shard = {}
+        for k, shard in keys:
+            rest = k[len(prefix):]
+            if rest.endswith(".weight_scale"):
+                continue
+            if EXPERT_RE.match(rest):
+                continue
+            by_shard.setdefault(shard, []).append((k, rest))
+        sd = {}
+        with torch.no_grad():
+            for shard, items in by_shard.items():
+                path = os.path.join(MODEL_DIR, shard)
+                with safe_open(path, framework="pt", backend="mmap") as f:
+                    for k, rest in items:
+                        t = f.get_tensor(k)
+                        if t.dtype == torch.int8:
+                            wt = dequantize(t, f.get_tensor(k + "_scale"))
+                        else:
+                            wt = t.to(DEVICE)
+                        if rest == "mlp.gate.e_score_correction_bias":
+                            wt = wt.to(torch.float32)
+                        sd[rest] = wt
+        if ramcache:
+            try:
+                os.makedirs(ramcache, exist_ok=True)
+                torch.save(sd, os.path.join(ramcache, f"layer{layer_idx}_ne.pt"))
+            except OSError:
+                pass  # ramdisk full/unavailable -> run without the cache
+    # Sparse layers: materialize the expert params as GPU zeros so the (unused) rows are
+    # defined; load_experts_used fills only the router-selected rows afterwards.
+    if config.mlp_layer_types[layer_idx] == "sparse":
+        n_exp, inter, h = config.n_routed_experts, config.moe_intermediate_size, config.hidden_size
+        sd["mlp.experts.gate_up_proj"] = torch.zeros((n_exp, 2 * inter, h), dtype=DTYPE, device=DEVICE)
+        sd["mlp.experts.down_proj"] = torch.zeros((n_exp, h, inter), dtype=DTYPE, device=DEVICE)
+    layer = model.model.layers[layer_idx]
+    _apply_sd(layer, sd, allow_missing_experts=True)
+    return layer
+
+
+def load_experts_used(model, config, layer_idx, keys, used):
+    """Dequantize only the router-selected experts and write them into the layer's
+    gate_up_proj / down_proj rows (already materialized as zeros by load_non_expert)."""
+    prefix = f"model.layers.{layer_idx}."
+    layer = model.model.layers[layer_idx]
+    gate_up = layer.mlp.experts.gate_up_proj
+    down = layer.mlp.experts.down_proj
+    inter = config.moe_intermediate_size
+    used_set = set(used)
     by_shard = {}
-    for k in keys:
-        by_shard.setdefault(weight_map[k], []).append(k)
+    for k, shard in keys:
+        m = EXPERT_RE.match(k[len(prefix):])
+        if m and int(m.group(1)) in used_set:
+            by_shard.setdefault(shard, []).append((k, int(m.group(1)), m.group(2)))
+    with torch.no_grad():
+        for shard, items in by_shard.items():
+            path = os.path.join(MODEL_DIR, shard)
+            with safe_open(path, framework="pt", backend="mmap") as f:
+                for k, n, proj in items:
+                    t = f.get_tensor(k)
+                    if t.dtype == torch.int8:
+                        wt = dequantize(t, f.get_tensor(k + "_scale"))
+                    else:
+                        wt = t.to(DEVICE)
+                    if proj == "gate_proj":
+                        gate_up[n, :inter, :] = wt
+                    elif proj == "up_proj":
+                        gate_up[n, inter:, :] = wt
+                    else:  # down_proj
+                        down[n] = wt
+
+
+def load_layer(model, config, layer_idx, keys):
+    """Full layer load (all 256 experts) -- the `full` mode, kept for verification."""
+    prefix = f"model.layers.{layer_idx}."
+    by_shard = {}
+    for k, shard in keys:
+        by_shard.setdefault(shard, []).append(k)
 
     sd = {}
     n_experts = config.n_routed_experts
@@ -179,15 +318,7 @@ def load_layer(model, config, layer_idx, weight_map):
             sd["mlp.experts.down_proj"] = down
 
         layer = model.model.layers[layer_idx]
-        res = layer.load_state_dict(sd, assign=True)
-        if res.missing_keys:
-            raise RuntimeError(f"layer {layer_idx} missing keys: {res.missing_keys}")
-        if res.unexpected_keys:
-            raise RuntimeError(f"layer {layer_idx} unexpected keys: {res.unexpected_keys[:10]}")
-        # Safety net: any parameter still on meta (should not happen) -> move to GPU zeros.
-        for p in layer.parameters():
-            if p.is_meta:
-                p.data = torch.zeros(p.shape, dtype=DTYPE, device=DEVICE)
+        _apply_sd(layer, sd, allow_missing_experts=False)
     return layer
 
 
@@ -196,8 +327,9 @@ def free_layer(model, layer_idx):
     torch.cuda.empty_cache()
 
 
-def forward_pass(model, config, cache, input_ids, load_cb, free_cb, max_layers=None):
-    """Replicates GlmMoeDsaModel.forward + lm_head for the last position."""
+def forward_pass(model, config, cache, input_ids, keys_by_layer, experts_mode, ramcache, max_layers=None):
+    """Replicates GlmMoeDsaModel.forward + lm_head for the last position, streaming layers.
+    For `ondemand` sparse layers the router is run first and only its selected experts load."""
     if max_layers is None:
         max_layers = config.num_hidden_layers
     with torch.no_grad():
@@ -217,17 +349,51 @@ def forward_pass(model, config, cache, input_ids, load_cb, free_cb, max_layers=N
         topk_indices = None
         for i in range(max_layers):
             layer = model.model.layers[i]
-            load_cb(i)
-            hidden, topk_indices = layer(
-                hidden,
-                attention_mask=mask_dict["deepseek_sparse_attention"],
-                position_embeddings=position_embeddings,
-                position_ids=position_ids,
-                past_key_values=cache,
-                use_cache=True,
-                prev_topk_indices=topk_indices,
-            )
-            free_cb(i)
+            is_sparse = config.mlp_layer_types[i] == "sparse"
+            if is_sparse and experts_mode == "ondemand":
+                t0 = time.time()
+                load_non_expert(model, config, i, keys_by_layer[i], ramcache)
+                ne_t = time.time() - t0
+                residual = hidden
+                ln = layer.input_layernorm(hidden)
+                attn_out, _, attn_topk = layer.self_attn(
+                    hidden_states=ln,
+                    attention_mask=mask_dict["deepseek_sparse_attention"],
+                    position_ids=position_ids,
+                    past_key_values=cache,
+                    use_cache=True,
+                    position_embeddings=position_embeddings,
+                    prev_topk_indices=topk_indices,
+                )
+                post_attn = residual + attn_out
+                mlp_in = layer.post_attention_layernorm(post_attn)
+                # Route first, then load exactly the experts the router selected.
+                _, topk_w, topk_i = layer.mlp.gate(mlp_in)
+                used = topk_i.reshape(-1).unique().tolist()
+                t1 = time.time()
+                load_experts_used(model, config, i, keys_by_layer[i], used)
+                exp_t = time.time() - t1
+                orig = post_attn.shape
+                mlp_out = layer.mlp.experts(mlp_in.reshape(-1, config.hidden_size), topk_i, topk_w)
+                mlp_out = mlp_out.reshape(orig) + layer.mlp.shared_experts(mlp_in)
+                hidden = post_attn + mlp_out
+                topk_indices = attn_topk
+                a, _ = gpu_mem_gb()
+                print(f"    layer {i:2d} (sparse, {len(used)} experts): ne={ne_t:4.1f}s exp={exp_t:4.1f}s | gpu alloc={a:.1f}GB", flush=True)
+            else:
+                t0 = time.time()
+                load_layer(model, config, i, keys_by_layer[i])
+                print(f"    loaded layer {i:2d} in {time.time() - t0:5.1f}s", flush=True)
+                hidden, topk_indices = layer(
+                    hidden,
+                    attention_mask=mask_dict["deepseek_sparse_attention"],
+                    position_embeddings=position_embeddings,
+                    position_ids=position_ids,
+                    past_key_values=cache,
+                    use_cache=True,
+                    prev_topk_indices=topk_indices,
+                )
+            free_layer(model, i)
         hidden = model.model.norm(hidden)
         logits = model.lm_head(hidden[:, -1:, :])
     return logits
@@ -239,7 +405,13 @@ def main():
     ap.add_argument("--tokens", type=int, default=GEN_TOKENS)
     ap.add_argument("--max-layers", type=int, default=78, help="for smoke test only")
     ap.add_argument("--no-decode", action="store_true", help="prefill only")
+    ap.add_argument("--experts", choices=["ondemand", "full"], default="ondemand",
+                    help="load only router-selected experts (ondemand) or all 256 (full)")
+    ap.add_argument("--ramcache", default=RAM_DIR, nargs="?", const=RAM_DIR,
+                    help="tmpfs ramdisk dir caching non-expert layer weights (default /mnt/glm_ram)")
+    ap.add_argument("--no-ramcache", action="store_true", help="disable ramdisk cache")
     args = ap.parse_args()
+    ramcache = None if args.no_ramcache else ensure_ramdisk(args.ramcache)
 
     print(f"torch={torch.__version__} hip={getattr(torch.version, 'hip', None)}")
     print(f"device={torch.cuda.get_device_name(0)} total_mem={torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
@@ -251,7 +423,8 @@ def main():
     config._attn_implementation = "eager"
     config._experts_implementation = "eager"
     print(f"config: layers={config.num_hidden_layers} experts={config.n_routed_experts} "
-          f"indexer_topk={config.index_topk} head_dim={config.head_dim}")
+          f"indexer_topk={config.index_topk} head_dim={config.head_dim} experts_mode={args.experts} "
+          f"ramcache={'off' if ramcache is None else ramcache}")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
     messages = [{"role": "user", "content": args.prompt}]
@@ -262,6 +435,13 @@ def main():
 
     model = build_model(config)
     weight_map = load_weight_map()
+
+    # Precompute per-layer key lists once.
+    keys_by_layer = {}
+    for k, shard in weight_map.items():
+        m = re.match(r"^model\.layers\.(\d+)\.", k)
+        if m and int(m.group(1)) < config.num_hidden_layers:
+            keys_by_layer.setdefault(int(m.group(1)), []).append((k, shard))
 
     print("\n[1/3] loading persistent weights ...")
     load_persistent_weights(model, weight_map)
@@ -274,41 +454,28 @@ def main():
     _ = _ @ torch.empty((512, 512), device=DEVICE, dtype=DTYPE).normal_()
     torch.cuda.synchronize()
 
-    loaded = set()
-    n_loads = 0
-
-    def load_cb(i):
-        nonlocal n_loads
-        if i not in loaded:
-            t0 = time.time()
-            load_layer(model, config, i, weight_map)
-            n_loads += 1
-            loaded.add(i)
-            if args.max_layers < 78 or n_loads % 10 == 0 or i in (0, 3, config.num_hidden_layers - 1):
-                a, r = gpu_mem_gb()
-                print(f"    loaded layer {i:2d} in {time.time() - t0:5.1f}s | gpu alloc={a:.1f}GB resv={r:.1f}GB")
-
-    def free_cb(i):
-        if i in loaded:
-            free_layer(model, i)
-            loaded.discard(i)
-            if args.max_layers < 78:
-                a, r = gpu_mem_gb()
-                print(f"    freed  layer {i:2d} | gpu alloc={a:.1f}GB resv={r:.1f}GB")
-
     generated = []
+    gen_pieces = []
+    n_loads = 0
     start = time.time()
     try:
         for step in range(args.tokens):
             cur = prompt_ids if step == 0 else torch.tensor([[generated[-1]]], device=DEVICE)
             t0 = time.time()
-            logits = forward_pass(model, config, cache, cur, load_cb, free_cb, max_layers=args.max_layers)
+            logits = forward_pass(
+                model, config, cache, cur, keys_by_layer,
+                experts_mode=args.experts, ramcache=ramcache, max_layers=args.max_layers,
+            )
             torch.cuda.synchronize()
+            n_loads += args.max_layers
             next_id = int(logits[:, -1, :].argmax(dim=-1).item())  # temperature = 0 (greedy)
             generated.append(next_id)
+            piece = tokenizer.decode([next_id])
+            gen_pieces.append(piece)
+            dt = time.time() - t0
             a, r = gpu_mem_gb()
-            print(f"step {step}: token={next_id} decoded={tokenizer.decode([next_id])!r} "
-                  f"| {time.time() - t0:6.1f}s | gpu alloc={a:.1f}GB resv={r:.1f}GB")
+            print(f"\n>>> STEP {step}: token_id={next_id} token={piece!r} "
+                  f"text_so_far={''.join(gen_pieces)!r} | {dt:6.1f}s | gpu alloc={a:.1f}GB resv={r:.1f}GB", flush=True)
             if next_id in EOS_IDS:
                 print("  (EOS reached)")
                 break
@@ -316,7 +483,7 @@ def main():
                 break
     finally:
         a, r = gpu_mem_gb()
-        print(f"\n=== DONE in {(time.time() - start) / 60:.1f} min | {n_loads} layer loads | gpu alloc={a:.1f}GB ===")
+        print(f"\n=== DONE in {(time.time() - start) / 60:.1f} min | ~{n_loads} layer loads | gpu alloc={a:.1f}GB ===")
 
     print("\n=== RESULTS ===")
     print(f"prompt: {args.prompt!r}")
