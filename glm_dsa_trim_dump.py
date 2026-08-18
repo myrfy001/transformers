@@ -517,7 +517,7 @@ def compare(first, second):
             if set(left) != set(right):
                 mismatches.append(path + ".keys")
             for key in set(left) & set(right):
-                if key != "elapsed_seconds":
+                if key not in ("elapsed_seconds", "run_index"):
                     visit(left[key], right[key], path + "." + key)
         elif isinstance(left, list) and isinstance(right, list):
             if len(left) != len(right):
