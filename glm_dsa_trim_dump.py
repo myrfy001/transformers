@@ -531,6 +531,31 @@ def compare(first, second):
     return {"status": "PASS" if not mismatches else "FAIL", "exact": not mismatches, "mismatches": mismatches}
 
 
+def build_semantic_artifact(steps, num_layers):
+    normalized = {}
+    for step_name, dump in steps.items():
+        step = "prefill" if step_name == "step0" else step_name.replace("step", "decode", 1)
+        normalized[step] = {
+            "embedding": dump["embed"],
+            "layer_input": [dump[f"layer{index}_in"] for index in range(num_layers)],
+            "post_attention_residual": [
+                dump[f"layer{index}_attn"] for index in range(num_layers)
+            ],
+            "mlp_input": [dump[f"layer{index}_mlp_in"] for index in range(num_layers)],
+            "layer_output": [dump[f"layer{index}_out"] for index in range(num_layers)],
+            "final_norm": dump["norm"],
+            "logits": dump["logits"],
+            "dsa_topk": [
+                dump[f"layer{index}_dsa"]["indices"] for index in range(num_layers)
+            ],
+        }
+    return {
+        "format": "glm52_transformers_semantic_v1",
+        "producer": "transformers",
+        "steps": normalized,
+    }
+
+
 def main(argv=None):
     args = parse_args(argv)
     if args.repeat < 1 or args.tokens < 1:
@@ -573,10 +598,16 @@ def main(argv=None):
             "sparse_selection_proved": sparse_proved,
         },
     }
-    output = Path(args.dump_dir) / "golden_dumps.pt"
-    output.parent.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(args.dump_dir)
+    output = output_dir / "golden_dumps.pt"
+    output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(artifact, output)
-    print(f"saved artifact: {output}\nFINAL {status}")
+    semantic = build_semantic_artifact(runs[0]["steps"], args.num_layers)
+    semantic["metadata"] = report["metadata"]
+    semantic_output = output_dir / "transformers_semantic.pt"
+    torch.save(semantic, semantic_output)
+    print(f"saved artifact: {output}")
+    print(f"saved semantic artifact: {semantic_output}\nFINAL {status}")
     return status != "PASS"
 
 
